@@ -1,0 +1,181 @@
+# Builds a DEBUG APK only. Never assembles the release variant.
+#
+# Why this does not call ./gradlew:
+#   The Gradle wrapper in this repository is incomplete. gradle/wrapper/gradle-wrapper.properties
+#   is committed, but gradlew, gradlew.bat and gradle-wrapper.jar are not, so ./gradlew does not
+#   exist and cannot be executed on a clean checkout. Gradle 9.3.1 is therefore installed
+#   explicitly below via gradle/actions/setup-gradle, which is the version AGP 9.1.1 requires
+#   (9.3.1 is both its minimum and its default).
+#   To switch back to ./gradlew, run `gradle wrapper --gradle-version 9.3.1` locally and commit
+#   gradlew, gradlew.bat and gradle/wrapper/gradle-wrapper.jar.
+#
+# No release keystore is required or referenced. assembleDebug is signed with AGP's
+# auto-generated ~/.android/debug.keystore, which is created on demand.
+
+name: Debug APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs so a force-push does not leave several APK builds racing.
+concurrency:
+  group: debug-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-apk:
+    name: Assemble debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          # AGP 9.1.1 requires JDK 17 as both the minimum and the default.
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          # android-actions/setup-android@v3 is deliberately NOT used. Its default `packages`
+          # input is "tools platform-tools", and the obsolete `tools` SDK package no longer
+          # exists in Google's repository, so the action aborts with
+          # "Warning: Failed to find package 'tools'" / sdkmanager exit code 1 before any
+          # Gradle step runs. GitHub-hosted runners already ship a working sdkmanager, so
+          # drive it directly instead of relying on that action.
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=""
+          for candidate in "${SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager \
+                           "${SDK_ROOT}"/cmdline-tools/*/bin/sdkmanager; do
+            if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::No sdkmanager found under ${SDK_ROOT}/cmdline-tools"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          # --licenses is interactive; `yes` answers the prompts. A non-zero exit here is
+          # not fatal because the real package install below re-checks and surfaces errors.
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+      - name: Install Android SDK 36.1 and Build Tools 36
+        run: |
+          # compileSdk is declared as release(36) { minorApiLevel = 1 }, i.e. Android 16 QPR2
+          # (API 36.1). The minor revision ships as a revision of the android-36 platform, so
+          # installing platforms;android-36 is what makes minorApiLevel = 1 resolvable.
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Report SDK state
+        run: |
+          echo "Installed platforms:"
+          ls -1 "${SDK_ROOT}/platforms" || true
+          echo "Installed build-tools:"
+          ls -1 "${SDK_ROOT}/build-tools" || true
+
+      - name: Assemble debug APK
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Verify APK exists
+        run: |
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then
+            echo "::error::Expected debug APK was not produced at $APK"
+            echo "Available APK outputs:"
+            find app/build/outputs -name '*.apk' 2>/dev/null || echo "  (none)"
+            exit 1
+          fi
+          echo "APK size: $(du -h "$APK" | cut -f1)"
+          ls -la "$APK"
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    # Kept as a separate job so a failing test never blocks or invalidates the debug APK
+    # artifact produced above.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Set up Android SDK
+        run: |
+          set -euo pipefail
+          # See the comment in the build-debug-apk job: setup-android@v3 fails because its
+          # default `packages` input still requests the removed `tools` SDK package.
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=""
+          for candidate in "${SDK_ROOT}"/cmdline-tools/latest/bin/sdkmanager \
+                           "${SDK_ROOT}"/cmdline-tools/*/bin/sdkmanager; do
+            if [ -x "$candidate" ]; then SDKMANAGER="$candidate"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::No sdkmanager found under ${SDK_ROOT}/cmdline-tools"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          echo "SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+
+      - name: Install Android SDK 36.1 and Build Tools 36
+        run: |
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Run unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
