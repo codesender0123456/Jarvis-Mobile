@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+   Auto Backup rules for API 30 and below.
+
+   jarvis_secure_prefs holds the Gemini API key and session-resumption handle. It must never be
+   uploaded:
+     - the file is encrypted with an AndroidKeyStore master key, which is device-bound and cannot
+       decrypt the file on a new device, so a restore would only produce a permanently broken
+       install that can never read its own key back;
+     - if the keystore is unavailable SecureStorage keeps secrets in memory only and writes
+       nothing, so there is no plaintext file to leak in the first place.
+   The app re-prompts for the key on the new device instead.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="jarvis_secure_prefs.xml" />
+</full-backup-content>
